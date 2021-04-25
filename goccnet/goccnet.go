@@ -3,9 +3,11 @@ package goccnet
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"time"
 
 	"github.com/tarm/serial"
@@ -35,18 +37,19 @@ var states = map[byte]string{
 	0x81: "Bill stacked",
 	0x82: "Bill returned"}
 
-var commands = map[string]byte{
-	"Reset":            0x30,
-	"GetStatus":        0x31,
-	"SetSecurity":      0x32,
-	"Poll":             0x33,
-	"EnableBillTypes":  0x34,
-	"Stack":            0x35,
-	"Return":           0x36,
-	"Identification":   0x37,
-	"Hold":             0x38,
-	"GetBillTable":     0x41,
-	"RequestStatistic": 0x60,
+var commands = map[byte]string{
+	0x30: "Reset",
+	0x31: "GetStatus",
+	0x32: "SetSecurity",
+	0x33: "Poll",
+	0x34: "EnableBillTypes",
+	0x35: "Stack",
+	0x36: "Return",
+	0x37: "Identification",
+	0x38: "Hold",
+	0x41: "GetBillTable",
+	0x60: "RequestStatistic",
+	0x00: "Ack",
 }
 
 const sync = 0x02
@@ -57,8 +60,18 @@ type Device struct {
 	// command *Command
 	config     *DeviceConfig
 	serialPort *serial.Port
-	states     map[byte]string
+	Status     string
 }
+
+type FrameBuffer struct {
+	SYNC []byte
+	ADR  []byte
+	LNG  []byte
+	CMD  []byte
+	DATA []byte
+	CRC  []byte
+}
+
 type DeviceConfig struct {
 	DeviceType byte
 	Path       string
@@ -71,7 +84,7 @@ func NewDevice(config *DeviceConfig) *Device {
 		false,
 		config,
 		nil,
-		states,
+		"",
 	}
 	return device
 }
@@ -111,20 +124,34 @@ func (device *Device) Reset() error {
 func (device *Device) Poll() error {
 	var code byte = 0x33
 	resp, err := device.Execute(code, nil)
-	r := bytes.NewBuffer(resp)
-	sync := r.Next(1)
-	addr := r.Next(1)
-	lng := r.Next(1)
-	cmd := r.Next(1)
-	lengh := int(lng[0])
-	data := []byte{}
-	crc := []byte{}
-	if lengh > 0 {
-		data = r.Next(int(lng[0]) - 6)
-		crc = r.Next(2)
+	frame := FrameBuffer{}
+
+	frame.buildFrameFromResp(resp)
+	if len(frame.DATA) > 0 {
+		device.Status = states[frame.DATA[0]]
 	}
-	fmt.Printf("Poll %v %v %v %v %v %v\n", sync, addr, lng, states[cmd[0]], data, crc)
+	fmt.Printf("Response s:%x a:%x l:%x c:%v d:%x crc:%x\n", frame.SYNC, frame.ADR, frame.LNG, frame.CMD, frame.DATA, frame.CRC)
 	return err
+}
+
+func (frame *FrameBuffer) buildFrameFromResp(resp []byte) error {
+	frame.SYNC = resp[0:1]
+	frame.ADR = resp[1:2]
+	frame.LNG = resp[2:3]
+	frame.CMD = resp[3:4]
+	frame.DATA = resp[4 : len(resp)-2]
+	frame.CRC = resp[len(resp)-2:]
+	// r := bytes.NewBuffer(resp)
+	// frame.SYNC = r.Next(1)
+	// frame.ADR = r.Next(1)
+	// frame.LNG = r.Next(1)
+	// frame.CMD = r.Next(1)
+	// lengh := int(frame.LNG[0])
+	// if lengh > 0 {
+	// 	frame.DATA = r.Next(lengh - 6)
+	// 	frame.CRC = r.Next(2)
+	// }
+	return nil
 }
 
 func (device *Device) Identification() error {
@@ -151,29 +178,48 @@ func (device *Device) EnableBillTypes() error {
 	return err
 }
 
+func ByteToFloat64(bytes []byte) float64 {
+	bits := binary.LittleEndian.Uint64(bytes)
+
+	return math.Float64frombits(bits)
+}
+
 func (device *Device) GetBillTable() error {
 	var code byte = 0x41
-	_, err := device.Execute(code, nil)
+	resp, err := device.Execute(code, nil)
+	frame := FrameBuffer{}
+	frame.buildFrameFromResp(resp)
+	if len(frame.DATA) > 0 {
+		for t := 0; t < 23; t++ {
+			word := frame.DATA[t*5 : t*5+5]
+			cur_nom := word[0]
+			cur_pow := word[4]
+			code := string(word[1:4])
+			fmt.Printf("code %v nom %x pow %x data %x\n", code, cur_nom, cur_pow, word)
+		}
+	}
+
+	fmt.Printf("Bill table %v\n", frame)
 	return err
 }
 
 func (device *Device) Execute(code byte, data []byte) ([]byte, error) {
 	cmd := bytes.NewBuffer([]byte{sync, device.config.DeviceType})
-	code_arr := []byte{code}
-	cmd.Write([]byte{(byte)(len(code_arr) + len(data) + 5)})
+	cmd.Write([]byte{(byte)(len(data) + 6)})
 	cmd.Write([]byte{code})
 	cmd.Write(data)
 
 	res := bytes.NewBuffer(cmd.Bytes())
 	res.Write(getCRC16(cmd.Bytes()))
-	// fmt.Printf("Request message buf: %x code: %x\n", res.Bytes(), code)
-	n, err := device.serialPort.Write(res.Bytes())
+	fmt.Printf("Request message buf: %x code: %v\n", res.Bytes(), commands[code])
+	n, err := device.serialPort.Write([]byte{0x02, 0x03, 0x06, 0x41, 0x4f, 0xd1})
 	if err != nil {
 		log.Printf("Write error %v\n", err)
 		return nil, err
 	}
 
 	buf := make([]byte, 256)
+	// if code != 0x00 { //ACK
 	n = 0
 	for n == 0 {
 		n, err = device.serialPort.Read(buf)
@@ -181,9 +227,6 @@ func (device *Device) Execute(code byte, data []byte) ([]byte, error) {
 			return nil, err
 		}
 	}
-	// fmt.Printf("Response message n: %v buf: %v code: %x\n", n, buf, code)
-	// if n != 6 {
-	// return nil, errors.New("received datagram with invalid size (must: 6, was: " + strconv.Itoa(n) + ")")
 	// }
 	return buf, nil
 }

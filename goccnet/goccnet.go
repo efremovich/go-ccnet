@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"time"
@@ -123,6 +124,9 @@ func (device *Device) Reset() error {
 func (device *Device) Poll() error {
 	var code byte = 0x33
 	resp, err := device.Execute(code, nil)
+	if err != nil {
+		fmt.Printf("Poll error %v", err)
+	}
 	frame := FrameBuffer{}
 
 	frame.buildFrameFromResp(resp)
@@ -186,11 +190,14 @@ func ByteToFloat64(bytes []byte) float64 {
 func (device *Device) GetBillTable() error {
 	var code byte = 0x41
 	resp, err := device.Execute(code, nil)
+	if err != nil {
+		fmt.Printf("Error responce Get bill %v", err)
+	}
 	frame := FrameBuffer{}
 	frame.buildFrameFromResp(resp)
 	fmt.Println(frame.DATA)
 	if len(frame.DATA) > 0 {
-		for t := 0; t < 23; t++ {
+		for t := 0; t < 24; t++ {
 			word := frame.DATA[t*5 : t*5+5]
 			cur_nom := word[0]
 			cur_pow := word[4]
@@ -212,7 +219,7 @@ func (device *Device) Execute(code byte, data []byte) ([]byte, error) {
 	res := bytes.NewBuffer(cmd.Bytes())
 	res.Write(getCRC16(cmd.Bytes()))
 	fmt.Printf("Request message buf: %x code: %v\n", res.Bytes(), commands[code])
-	n, err := device.serialPort.Write(res.Bytes())
+	_, err := device.serialPort.Write(res.Bytes())
 	if err != nil {
 		log.Printf("Write error %v\n", err)
 		return nil, err
@@ -221,21 +228,15 @@ func (device *Device) Execute(code byte, data []byte) ([]byte, error) {
 	buf := []byte{}
 	buf1 := make([]byte, 256)
 	if code != 0x00 { //ACK
-		i := 0
-		l := 0
 		for {
-			n, err = device.serialPort.Read(buf1)
-			if err != nil {
+			n, err := device.serialPort.Read(buf1)
+
+			buf = append(buf, buf1[:n]...)
+			fmt.Printf("n %v buf %v\n", n, buf1[:n])
+			if err != nil && err != io.EOF {
 				return nil, err
 			}
-			buf = append(buf, buf1...)
-			i += n
-			fmt.Printf("%v %v\n", i, buf1[:i])
-			if l == 0 {
-				l = int(buf1[2:3][0])
-
-			}
-			if l == i {
+			if n == 0 {
 				return buf, nil
 			}
 		}

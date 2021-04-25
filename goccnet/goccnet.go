@@ -67,7 +67,6 @@ type FrameBuffer struct {
 	SYNC []byte
 	ADR  []byte
 	LNG  []byte
-	CMD  []byte
 	DATA []byte
 	CRC  []byte
 }
@@ -93,7 +92,7 @@ func (device *Device) Connect() {
 	conf := &serial.Config{
 		Name:        device.config.Path,
 		Baud:        device.config.Baud,
-		ReadTimeout: 100 * time.Millisecond,
+		ReadTimeout: 1000 * time.Millisecond,
 		Size:        0,
 		Parity:      0,
 		StopBits:    0,
@@ -130,17 +129,17 @@ func (device *Device) Poll() error {
 	if len(frame.DATA) > 0 {
 		device.Status = states[frame.DATA[0]]
 	}
-	fmt.Printf("Response s:%x a:%x l:%x c:%v d:%x crc:%x\n", frame.SYNC, frame.ADR, frame.LNG, frame.CMD, frame.DATA, frame.CRC)
+	fmt.Printf("Response s:%x a:%x l:%x d:%x crc:%x\n", frame.SYNC, frame.ADR, frame.LNG, frame.DATA, frame.CRC)
 	return err
 }
 
 func (frame *FrameBuffer) buildFrameFromResp(resp []byte) error {
+	fmt.Println("dddddddd", resp)
 	frame.SYNC = resp[0:1]
 	frame.ADR = resp[1:2]
 	frame.LNG = resp[2:3]
-	frame.CMD = resp[3:4]
-	frame.DATA = resp[4 : len(resp)-2]
-	frame.CRC = resp[len(resp)-2:]
+	frame.DATA = resp[3 : int(frame.LNG[0])-5]
+	frame.CRC = resp[int(frame.LNG[0])-2:]
 	// r := bytes.NewBuffer(resp)
 	// frame.SYNC = r.Next(1)
 	// frame.ADR = r.Next(1)
@@ -189,13 +188,14 @@ func (device *Device) GetBillTable() error {
 	resp, err := device.Execute(code, nil)
 	frame := FrameBuffer{}
 	frame.buildFrameFromResp(resp)
+	fmt.Println(frame.DATA)
 	if len(frame.DATA) > 0 {
 		for t := 0; t < 23; t++ {
 			word := frame.DATA[t*5 : t*5+5]
 			cur_nom := word[0]
 			cur_pow := word[4]
 			code := string(word[1:4])
-			fmt.Printf("code %v nom %x pow %x data %x\n", code, cur_nom, cur_pow, word)
+			fmt.Printf("code %v nom %v pow %v data %v\n", code, cur_nom, cur_pow, word)
 		}
 	}
 
@@ -212,22 +212,34 @@ func (device *Device) Execute(code byte, data []byte) ([]byte, error) {
 	res := bytes.NewBuffer(cmd.Bytes())
 	res.Write(getCRC16(cmd.Bytes()))
 	fmt.Printf("Request message buf: %x code: %v\n", res.Bytes(), commands[code])
-	n, err := device.serialPort.Write([]byte{0x02, 0x03, 0x06, 0x41, 0x4f, 0xd1})
+	n, err := device.serialPort.Write(res.Bytes())
 	if err != nil {
 		log.Printf("Write error %v\n", err)
 		return nil, err
 	}
 
-	buf := make([]byte, 256)
-	// if code != 0x00 { //ACK
-	n = 0
-	for n == 0 {
-		n, err = device.serialPort.Read(buf)
-		if err != nil {
-			return nil, err
+	buf := []byte{}
+	buf1 := make([]byte, 256)
+	if code != 0x00 { //ACK
+		i := 0
+		l := 0
+		for {
+			n, err = device.serialPort.Read(buf1)
+			if err != nil {
+				return nil, err
+			}
+			buf = append(buf, buf1...)
+			i += n
+			fmt.Printf("%v %v\n", i, buf1[:i])
+			if l == 0 {
+				l = int(buf1[2:3][0])
+
+			}
+			if l == i {
+				return buf, nil
+			}
 		}
 	}
-	// }
 	return buf, nil
 }
 

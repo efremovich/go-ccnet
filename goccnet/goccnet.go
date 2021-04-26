@@ -2,10 +2,6 @@ package goccnet
 
 import (
 	"bytes"
-	"context"
-	"encoding/binary"
-	"errors"
-	"fmt"
 	"io"
 	"log"
 	"math"
@@ -37,6 +33,29 @@ var states = map[byte]string{
 	0x80: "Escrow position",
 	0x81: "Bill stacked",
 	0x82: "Bill returned"}
+var subStates = map[byte]string{
+	0x60: "due to Insertion",
+	0x61: "due to Magnetic",
+	0x62: "due to Ramained bill in head",
+	0x63: "due to Multiplying",
+	0x64: "due to Converting",
+	0x65: "due to Identification",
+	0x66: "due to Verification",
+	0x67: "due to Optic",
+	0x68: "due to Inhibit",
+	0x69: "due to Capacity",
+	0x6A: "due to Operation",
+	0x6C: "due to Leght",
+
+	0x50: "Stack Motor Failed",
+	0x51: "Transport Motor Speed Failure",
+	0x52: "Transport Motor Failure",
+	0x53: "Aligning Motor Failure",
+	0x54: "Cassette Status Failure",
+	0x55: "Optic Cancl Failure",
+	0x56: "Magnetic Canal Failure",
+	0x5F: "Capacitance Canal Failure",
+}
 
 var commands = map[byte]string{
 	0x30: "Reset",
@@ -57,11 +76,12 @@ const sync = 0x02
 
 type Device struct {
 	isConnect bool
-	busy      bool
 	// command *Command
 	config     *DeviceConfig
 	serialPort *serial.Port
 	Status     string
+	BillStack  chan int
+	billTable  map[int]int
 }
 
 type FrameBuffer struct {
@@ -81,10 +101,11 @@ type DeviceConfig struct {
 func NewDevice(config *DeviceConfig) *Device {
 	device := &Device{
 		false,
-		false,
 		config,
 		nil,
 		"",
+		make(chan int),
+		make(map[int]int),
 	}
 	return device
 }
@@ -93,7 +114,7 @@ func (device *Device) Connect() {
 	conf := &serial.Config{
 		Name:        device.config.Path,
 		Baud:        device.config.Baud,
-		ReadTimeout: 1000 * time.Millisecond,
+		ReadTimeout: 300 * time.Millisecond,
 		Size:        0,
 		Parity:      0,
 		StopBits:    0,
@@ -109,6 +130,7 @@ func (device *Device) Connect() {
 	}
 	device.isConnect = true
 }
+
 func (device *Device) Ack() error {
 	var code byte = 0x00
 	_, err := device.Execute(code, nil)
@@ -121,39 +143,66 @@ func (device *Device) Reset() error {
 	return err
 }
 
+func (device *Device) StartPoll() error {
+	for {
+		switch device.Status {
+		case "Initialize":
+			if err := device.Ack(); err != nil {
+				return err
+			}
+			if err := device.EnableBillTypes(); err != nil {
+				return err
+			}
+			if err := device.Poll(); err != nil {
+				return err
+			}
+		default:
+			if err := device.Ack(); err != nil {
+				return err
+			}
+			if err := device.Poll(); err != nil {
+				return err
+			}
+		}
+
+	}
+}
+
 func (device *Device) Poll() error {
 	var code byte = 0x33
 	resp, err := device.Execute(code, nil)
 	if err != nil {
-		fmt.Printf("Poll error %v", err)
+		return err
 	}
 	frame := FrameBuffer{}
 
 	frame.buildFrameFromResp(resp)
 	if len(frame.DATA) > 0 {
 		device.Status = states[frame.DATA[0]]
+		if int(frame.LNG[0]) > 6 {
+			device.Status += " " + subStates[frame.DATA[1]]
+		}
 	}
-	fmt.Printf("Response s:%x a:%x l:%x d:%x crc:%x\n", frame.SYNC, frame.ADR, frame.LNG, frame.DATA, frame.CRC)
+	// fmt.Printf("Response status:%v\n", device.Status)
+	if len(device.billTable) == 0 {
+		device.GetBillTable()
+	}
+	if frame.DATA[0] == 0x81 {
+		device.BillStack <- device.billTable[int(frame.DATA[1])]
+	}
 	return err
 }
 
 func (frame *FrameBuffer) buildFrameFromResp(resp []byte) error {
-	fmt.Println("dddddddd", resp)
-	frame.SYNC = resp[0:1]
-	frame.ADR = resp[1:2]
-	frame.LNG = resp[2:3]
-	frame.DATA = resp[3 : int(frame.LNG[0])-5]
-	frame.CRC = resp[int(frame.LNG[0])-2:]
-	// r := bytes.NewBuffer(resp)
-	// frame.SYNC = r.Next(1)
-	// frame.ADR = r.Next(1)
-	// frame.LNG = r.Next(1)
-	// frame.CMD = r.Next(1)
-	// lengh := int(frame.LNG[0])
-	// if lengh > 0 {
-	// 	frame.DATA = r.Next(lengh - 6)
-	// 	frame.CRC = r.Next(2)
-	// }
+	r := bytes.NewBuffer(resp)
+	frame.SYNC = r.Next(1)
+	frame.ADR = r.Next(1)
+	frame.LNG = r.Next(1)
+	lengh := int(frame.LNG[0])
+	if lengh > 0 {
+		frame.DATA = r.Next(lengh - 5)
+		frame.CRC = r.Next(2)
+	}
 	return nil
 }
 
@@ -177,37 +226,36 @@ func (device *Device) GetStatus() error {
 
 func (device *Device) EnableBillTypes() error {
 	var code byte = 0x34
+	// TODO реализовать интерфейс настройки приема вида купюр
 	_, err := device.Execute(code, []byte{0xff, 0xff, 0xff, 0, 0, 0})
 	return err
 }
 
-func ByteToFloat64(bytes []byte) float64 {
-	bits := binary.LittleEndian.Uint64(bytes)
-
-	return math.Float64frombits(bits)
+func (device *Device) RequestStatistic() error {
+	var code byte = 0x60
+	_, err := device.Execute(code, []byte{})
+	return err
 }
 
 func (device *Device) GetBillTable() error {
 	var code byte = 0x41
 	resp, err := device.Execute(code, nil)
 	if err != nil {
-		fmt.Printf("Error responce Get bill %v", err)
+		return err
 	}
 	frame := FrameBuffer{}
 	frame.buildFrameFromResp(resp)
-	fmt.Println(frame.DATA)
 	if len(frame.DATA) > 0 {
 		for t := 0; t < 24; t++ {
 			word := frame.DATA[t*5 : t*5+5]
 			cur_nom := word[0]
 			cur_pow := word[4]
-			code := string(word[1:4])
-			fmt.Printf("code %v nom %v pow %v data %v\n", code, cur_nom, cur_pow, word)
+			amount := int(cur_nom) * int(math.Pow10(int(cur_pow)))
+			device.billTable[t] = amount
 		}
 	}
-
-	fmt.Printf("Bill table %v\n", frame)
-	return err
+	// fmt.Printf("Bill table %v\n", BillTable)
+	return nil
 }
 
 func (device *Device) Execute(code byte, data []byte) ([]byte, error) {
@@ -218,7 +266,7 @@ func (device *Device) Execute(code byte, data []byte) ([]byte, error) {
 
 	res := bytes.NewBuffer(cmd.Bytes())
 	res.Write(getCRC16(cmd.Bytes()))
-	fmt.Printf("Request message buf: %x code: %v\n", res.Bytes(), commands[code])
+	// fmt.Printf("Request message buf: %x code: %v\n", res.Bytes(), commands[code])
 	_, err := device.serialPort.Write(res.Bytes())
 	if err != nil {
 		log.Printf("Write error %v\n", err)
@@ -226,13 +274,12 @@ func (device *Device) Execute(code byte, data []byte) ([]byte, error) {
 	}
 
 	buf := []byte{}
-	buf1 := make([]byte, 256)
+	tmpbuf := make([]byte, 256)
 	if code != 0x00 { //ACK
 		for {
-			n, err := device.serialPort.Read(buf1)
+			n, err := device.serialPort.Read(tmpbuf)
 
-			buf = append(buf, buf1[:n]...)
-			fmt.Printf("n %v buf %v\n", n, buf1[:n])
+			buf = append(buf, tmpbuf[:n]...)
 			if err != nil && err != io.EOF {
 				return nil, err
 			}
@@ -242,11 +289,6 @@ func (device *Device) Execute(code byte, data []byte) ([]byte, error) {
 		}
 	}
 	return buf, nil
-}
-
-func timeOutPortScanner(ctx context.Context) error {
-	time.Sleep(1 * time.Millisecond)
-	return errors.New("time out 200 ms")
 }
 
 func getCRC16(data []byte) []byte {
